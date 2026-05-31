@@ -6,8 +6,8 @@
  * operations.
  */
 
-import { SuiJsonRpcClient } from '@mysten/sui/jsonRpc';
-import { getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import { SuiJsonRpcClient, getJsonRpcFullnodeUrl } from '@mysten/sui/jsonRpc';
+import type { SuiClientTypes } from '@mysten/sui/client';
 import { Transaction } from '@mysten/sui/transactions';
 import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 import type {
@@ -96,7 +96,7 @@ export class DeepBookClient {
       ? network
       : getJsonRpcFullnodeUrl(network as 'mainnet' | 'testnet' | 'devnet');
 
-    this.client = new SuiJsonRpcClient({ url: rpcUrl });
+    this.client = new SuiJsonRpcClient({ url: rpcUrl, network: network as SuiClientTypes.Network });
     this.keypair = config.keypair;
     this.gasBudget = config.gasBudget ?? DEFAULT_GAS_BUDGET;
   }
@@ -128,38 +128,29 @@ export class DeepBookClient {
       transaction: tx,
     });
 
-    if (result.$kind === 'FailedTransaction') {
+    if (result.effects?.status?.status !== 'success') {
       throw new DeepBookError(
-        `Transaction failed`,
+        `Transaction failed: ${result.effects?.status?.error ?? 'unknown error'}`,
         'TX_EXECUTION_FAILED',
         result
       );
     }
 
-    // Wait for the transaction with effects included
+    // Wait for the transaction to settle
     const txResult = await this.client.waitForTransaction({
-      digest: result.Transaction.digest,
+      digest: result.digest,
     });
 
-    if (txResult.$kind === 'FailedTransaction') {
+    if (txResult.effects?.status?.status !== 'success') {
+      const error = txResult.effects?.status?.error ?? 'unknown error';
       throw new DeepBookError(
-        `Transaction failed after submission`,
+        `Transaction failed after submission: ${error}`,
         'TX_EXECUTION_FAILED',
         txResult
       );
     }
 
-    // Check status on the settled transaction (effects must be requested)
-    if (txResult.Transaction.effects?.status?.status !== 'success') {
-      const error = txResult.Transaction.effects?.status?.error ?? 'unknown error';
-      throw new DeepBookError(
-        `Transaction failed: ${error}`,
-        'TX_EXECUTION_FAILED',
-        txResult
-      );
-    }
-
-    return result.Transaction.digest;
+    return result.digest;
   }
 
   /* ─── Pool Operations ─────────────────────────────────────────────── */
