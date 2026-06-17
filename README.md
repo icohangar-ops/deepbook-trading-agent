@@ -1,15 +1,14 @@
-# DeepBook Trading Agent ⚡
+# DeepBook Trading Agent
 
-> **AI-powered, autonomous trading on DeepBook (Sui's on-chain orderbook).**
+> AI-powered, autonomous trading on DeepBook (Sui's on-chain orderbook).
 > Reusable TypeScript library for market making, arbitrage, hedging, and liquidity strategies.
 
-[![Sui](https://img.shields.io/badge/Sui-1.73.0-4da2ff?logo=sui)](https://sui.io)
 [![DeepBook](https://img.shields.io/badge/DeepBook-v3-6b46c1)](https://docs.sui.io/deepbook)
 [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
                      ┌──────────────────────┐
@@ -40,7 +39,7 @@
 └────────────────────────────────────────────────────┘
 ```
 
-## ✨ Features
+## Features
 
 ### DeepBook Client (`deepbook-client.ts`)
 - **Pool Management** — Create and manage outcome token pools (YES/NO)
@@ -81,89 +80,111 @@
 - `getAgentReport()` — Returns P&L, win rate, position summary
 - **Verifiable Audit Trail** — All trade decisions stored on Walrus
 
-## 🚀 Quickstart
+## Quickstart
 
 ### Install
 
 ```bash
-npm install @mysten/sui.js
-# or
-pnpm add @mysten/sui.js
+pnpm add @mysten/sui @mysten/walrus
 ```
 
 ### Basic Usage
 
 ```typescript
-import { DeepBookClient } from './deepbook-client';
-import { SuiClient, getFullnodeUrl } from '@mysten/sui.js/client';
-import { Ed25519Keypair } from '@mysten/sui.js/keypairs/ed25519';
+import { DeepBookClient } from 'deepbook-trading-agent';
+import { Ed25519Keypair } from '@mysten/sui/keypairs/ed25519';
 
-// Connect to Sui
-const suiClient = new SuiClient({ url: getFullnodeUrl('testnet') });
-const keypair = Ed25519Keypair.fromSecretKey('...');
+// Create a DeepBook client. The keypair is optional; without it,
+// only read-only queries (orderbook, depth) are available.
+const keypair = Ed25519Keypair.generate();
+const db = new DeepBookClient({ network: 'testnet', keypair });
 
-// Create DeepBook client
-const db = new DeepBookClient(suiClient, keypair);
-
-// Get orderbook
-const orderbook = await db.getOrderbook('pool_yes_no_001');
+// Get an orderbook snapshot
+const orderbook = await db.getOrderbook('0x...pool');
 console.log(`Bids: ${orderbook.bids.length}, Asks: ${orderbook.asks.length}`);
 
-// Place a bid
-const orderId = await db.placeOrder({
-  poolId: 'pool_yes_no_001',
+// Place a limit order
+const order = await db.placeOrder({
+  poolId: '0x...pool',
   side: 'bid',
-  price: 0.45,
-  quantity: 1000
+  price: 450,
+  quantity: 1000,
+});
+```
+
+### Running a Strategy
+
+Strategies take the client and a `PTBTrader`, plus a strategy-specific config:
+
+```typescript
+import {
+  DeepBookClient,
+  PTBTrader,
+  MarketMakingStrategy,
+} from 'deepbook-trading-agent';
+
+const client = new DeepBookClient({ network: 'testnet', keypair });
+const ptbTrader = new PTBTrader(client);
+
+const strategy = new MarketMakingStrategy(client, ptbTrader, {
+  poolId: '0x...pool',
+  spreadFraction: 0.02,      // 2% spread around mid price
+  positionSize: '500',
+  refreshIntervalMs: 30000,  // refresh every 30s
+  maxPosition: '50000',
+  minProfitThreshold: '100',
 });
 
-// Run a market making strategy
-import { MarketMakingStrategy } from './strategies';
-
-const strategy = new MarketMakingStrategy({
-  suiClient,
-  keypair,
-  poolId: 'pool_yes_no_001',
-  spreadPercent: 2,
-  orderSize: 500,
-  refreshInterval: 30000 // 30 seconds
-});
 await strategy.start();
 ```
 
 ### With AI Agent Integration
 
+`AgentTradingSession` accepts trading decisions produced by an AI agent,
+validates them against the session's risk limits, executes them, and stores
+each decision on Walrus as a verifiable audit trail.
+
 ```typescript
-import { AgentTradingSession } from './agent-integration';
-import { WalrusClient } from './walrus-client';
+import {
+  DeepBookClient,
+  AgentTradingSession,
+  WalrusAuditStore,
+} from 'deepbook-trading-agent';
 
+const client = new DeepBookClient({ network: 'testnet', keypair });
 const session = new AgentTradingSession({
-  suiClient,
-  keypair,
-  strategy: 'arbitrage',
-  constraints: { maxPosition: 10000, maxSlippage: 0.5 }
+  client,
+  config: {
+    sessionId: 'session-1',
+    allowedPools: ['0x...poolYes', '0x...poolNo'],
+    maxCapital: '500000',
+    riskLimits: {
+      maxPositionPerPool: '100000',
+      maxDrawdownFraction: 0.15,
+      maxDailyTrades: 100,
+    },
+  },
+  walrusStore: new WalrusAuditStore(),
 });
 
-// Agent deliberates and decides to trade
-const decision = await session.deliberate({
-  marketData: orderbook,
-  analysis: {
-    sentiment: 'bullish',
-    confidence: 0.78,
-    reasoning: 'Prediction odds diverging from fundamentals...'
-  }
+// Execute a decision produced by your agent
+const result = await session.executeAgentDecision({
+  action: 'arbitrage',
+  poolId: '0x...poolYes',
+  reason: 'Prediction odds diverging from fundamentals',
+  confidence: 0.78,
+  params: { poolIds: ['0x...poolYes', '0x...poolNo'], minProfitFraction: 0.005 },
 });
 
-// Execute agent decision atomically
-const result = await session.executeAgentDecision(decision);
-
-// Get performance report
+// Get a performance report
 const report = await session.getAgentReport();
-console.log(`Win Rate: ${report.winRate}%`);
-console.log(`Total P&L: ${report.totalPnL} SUI`);
+console.log(`Win rate: ${(report.winRate * 100).toFixed(1)}%`);
+console.log(`Trades: ${report.totalTrades}`);
 ```
 
-## 📚 API Reference
+See [`src/demo.ts`](src/demo.ts) for an end-to-end walkthrough.
+
+## API Reference
 
 ### `DeepBookClient`
 
@@ -173,8 +194,8 @@ console.log(`Total P&L: ${report.totalPnL} SUI`);
 | `placeOrder(params)` | Place a limit order |
 | `cancelOrder(orderId)` | Cancel an existing order |
 | `getOrderbook(poolId)` | Get orderbook snapshot |
-| `getDepth(poolId, levels)` | Get market depth |
-| `swapExactInput(params)` | Execute a market swap |
+| `getDepth(poolId)` | Get market depth |
+| `swapExactInput(poolId, amountIn, minOut)` | Execute a market swap |
 
 ### Trading Strategies
 
@@ -189,12 +210,12 @@ console.log(`Total P&L: ${report.totalPnL} SUI`);
 
 | Method | Description |
 | ------ | ----------- |
-| `deliberate(context)` | AI agent analyzes market and decides |
-| `executeAgentDecision(decision)` | Execute agent's decision atomically |
-| `getAgentReport(sessionId)` | Get agent trading performance report |
-| `getPositionSummary()` | Get current position snapshot |
+| `executeAgentDecision(decision)` | Validate and execute an agent's decision |
+| `getAgentReport()` | Get session trading performance report |
+| `getStrategyStatuses()` | Get status of all active strategies |
+| `stopAll()` | Stop all active strategies |
 
-## 🎯 Use Cases
+## Use Cases
 
 ### Sui Overflow 2026 — Infra & DevX Track
 This library is a **Sui native primitive** for building agentic trading systems:
@@ -211,7 +232,7 @@ This library is a **Sui native primitive** for building agentic trading systems:
 
 *\*Adaptation needed — this library is Sui-native.*
 
-## 🛠️ Development
+## Development
 
 ```bash
 pnpm install
@@ -219,10 +240,10 @@ pnpm build
 pnpm test
 
 # Run demo
-pnpm tsx src/demo.ts
+pnpm demo
 ```
 
-## 📦 Project Structure
+## Project Structure
 
 ```
 deepbook-trading-agent/
@@ -239,7 +260,7 @@ deepbook-trading-agent/
 └── README.md
 ```
 
-## 📄 License
+## License
 
 MIT — build freely.
 
