@@ -43,13 +43,15 @@ describe('confineToBase', () => {
 describe('loadPolicy', () => {
   it('loads the in-tree config/policy.yaml via the default path', () => {
     const policy = loadPolicy();
-    expect(policy.version).toBe('1.0');
+    // File values (not the conservative built-in default).
     expect(policy.maxNotionalUsd).toBe(50000);
+    expect(policy.dailyNotionalCapUsd).toBe(250000);
+    expect(policy.hitlThresholdUsd).toBe(25000);
   });
 
   it('loads a relative in-tree path and a same-tree .. segment', () => {
-    expect(loadPolicy('config/policy.yaml').version).toBe('1.0');
-    expect(loadPolicy('config/../config/policy.yaml').version).toBe('1.0');
+    expect(loadPolicy('config/policy.yaml').maxNotionalUsd).toBe(50000);
+    expect(loadPolicy('config/../config/policy.yaml').maxNotionalUsd).toBe(50000);
   });
 
   it('falls back to the conservative default when the path escapes cwd', () => {
