@@ -210,7 +210,7 @@ See [`src/demo.ts`](src/demo.ts) for an end-to-end walkthrough.
 
 | Method | Description |
 | ------ | ----------- |
-| `executeAgentDecision(decision)` | Validate and execute an agent's decision |
+| `executeAgentDecision(decision)` | Validate and execute an agent's decision. Returns a `TradeResult` carrying the audit fields `success`, `chpDecisionId`, `chpSessionStatus`, `receiptActor` (named confirmer or `chp:policy-engine`), and `receiptNonce` (consumed single-use receipt nonce) — record all of them in downstream audit logging. |
 | `getAgentReport()` | Get session trading performance report |
 | `getStrategyStatuses()` | Get status of all active strategies |
 | `stopAll()` | Stop all active strategies |
@@ -297,7 +297,10 @@ pattern proven in `erp-control-plane` (`api/genbi/chp.py`):
    `session.getDecisionLedger()`.
 
 `executeAgentDecision` returns `chpDecisionId` / `chpSessionStatus` on each
-`TradeResult`. The demo runs the full loop with a static portfolio snapshot
+`TradeResult`, plus `receiptActor` / `receiptNonce` when a receipt was
+verified at the execution boundary — the full audit key set is
+`success`, `chpDecisionId`, `chpSessionStatus`, `receiptActor`,
+`receiptNonce`. The demo runs the full loop with a static portfolio snapshot
 and names its operator as the confirmer.
 
 ```ts
@@ -312,6 +315,62 @@ const session = new AgentTradingSession({
 const result = await session.executeAgentDecision(decision, { confirmedBy: 'operator@example.com' });
 if (result.success) console.log(result.chpDecisionId, result.chpSessionStatus); // LOCKED
 ```
+
+### Tool-approval receipts (row 22: an allowlist is not authorization)
+
+A CHP verdict — even a `LOCKED` hardening decision — is an *allowlist
+answer*. Authorization to move capital is a separate act:
+`executeAgentDecision` (`src/agent-integration.ts`) issues a
+**tool-approval receipt** (`src/chp/receipt.ts`, ported from
+`cubiczan-chp-mcp` `src/receipt.ts` via the cognitrader-bsc merged port)
+binding actor, tool (`deepbook_execute`), resource
+(`deepbook:execute:<poolId>`), the exact trade arguments (SHA-256 over the
+canonical JSON form — `src/chp/canonical.ts`), policy version, risk tier, a
+300s expiry, and a single-use nonce, all HMAC-SHA256-signed. The receipt is
+verified at the execution boundary — fail-closed signature, expiry,
+args-hash, and policy-version checks with timing-safe comparison — and its
+nonce is consumed through the replay store (`src/chp/replay.ts`) before any
+order is built; replaying the same receipt is a deny.
+
+- `DEEPBOOK_CHP_RECEIPT_KEY` — HMAC signing key. **Fail-closed**: unset or
+  blank refuses every order (`resolveReceiptKey` throws — there is no
+  committed default key).
+- `DEEPBOOK_CHP_REPLAY_LOG` — nonce replay log (default
+  `state/replay-nonces.jsonl`); consumed approvals survive a restart, and a
+  corrupt log line is skipped rather than trusted. Entries older than the
+  receipt TTL (300s) are **pruned on startup** and the log compacted — a
+  nonce past the TTL cannot be replayed by a valid receipt, so this bounds
+  startup cost for long-running deployments with no security regression;
+  records with an unparseable timestamp are kept, never dropped.
+
+`TradeResult` records `receiptActor` (the named confirmer, or
+`chp:policy-engine` for autonomous execution) and `receiptNonce` (the
+consumed single-use nonce — the replay audit key).
+
+**Risk tier is audit-only today.** The tier is computed from the trade
+notional relative to the policy spending ceiling — `high` at 50% of the
+ceiling or above (an arbitrary-but-deterministic boundary), `medium` for
+any positive notional, `low` at zero — and is signed into the receipt and
+recorded with the trade result. No gate, alert, or HITL trigger behaves
+differently for `high` vs `medium` yet; an operator seeing a `high` receipt
+should not expect a behavioral consequence. Wiring one (for example, a
+HITL trigger at the `high` boundary) is the documented reopening condition.
+
+## Propagation notes (wave B)
+
+- **Row 22 (tool-approval receipts) — adopted.** Signed, single-use
+  authorization receipts at the trade-execution boundary:
+  `src/chp/receipt.ts` (HMAC-SHA256 over canonical JSON, fail-closed key
+  resolution), `src/chp/replay.ts` (persistent nonce replay store),
+  `src/chp/canonical.ts` (deterministic serialization), wired into
+  `executeAgentDecision` in `src/agent-integration.ts`. See the
+  Tool-approval receipts section above.
+- **Row 3 (tiered market-data resolution) — reversed.** The agent reads a
+  single venue: every price/orderbook path consumes the DeepBook SDK
+  (`src/deepbook-client.ts`); there is no independent market-data feed,
+  cache/fallback chain, or degradation state to tier. The row's opening
+  condition (a second independent source feeding the decision path) is not
+  met; re-evaluate if off-chain market data is ever added.
 
 ## Development
 
@@ -339,7 +398,10 @@ deepbook-trading-agent/
 │   ├── chp/                   # CHP decision gate + hardening layer
 │   │   ├── gate.ts            # Profile B spend gate (normative @cubiczan/chp)
 │   │   ├── policy.ts          # Policy loading with safe defaults
-│   │   └── hardening.ts       # R0 + foundation + human lock + ledger
+│   │   ├── hardening.ts       # R0 + foundation + human lock + ledger
+│   │   ├── canonical.ts       # Deterministic canonical JSON (receipt digests)
+│   │   ├── receipt.ts         # Row-22 signed tool-approval receipts
+│   │   └── replay.ts          # Single-use nonce replay store (JSONL-backed)
 │   └── __tests__/             # Test suites
 ├── config/
 │   └── policy.yaml            # CHP spend-gate policy

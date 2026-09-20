@@ -176,6 +176,10 @@ export interface TradeResult {
   chpDecisionId?: string;
   /** CHP hardening: session status at seal time (PROVISIONAL_LOCK / LOCKED). */
   chpSessionStatus?: string;
+  /** Row-22 receipt: actor that authorized the executed trade. */
+  receiptActor?: string;
+  /** Row-22 receipt: consumed single-use nonce (replay audit key). */
+  receiptNonce?: string;
 }
 
 export interface TradingSessionConfig {

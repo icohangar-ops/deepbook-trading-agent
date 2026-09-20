@@ -21,6 +21,7 @@ import { WalrusAuditStore } from '../ptb-trading.js';
 import { AgentTradingSession } from '../agent-integration.js';
 import { ChpGate } from '../chp/gate.js';
 import type { RiskPolicy } from '../chp/policy.js';
+import { InMemoryReplayStore } from '../chp/replay.js';
 import {
   TradeHardeningGate,
   TradeRejection,
@@ -427,6 +428,10 @@ describe('AgentTradingSession CHP hardening wiring', () => {
       chpGate: new ChpGate(makePolicy()),
       chpHardening: opts.gate,
       portfolioState: opts.portfolio ?? new StaticPortfolioStateProvider(snapshot()),
+      // Row-22 boundary: execution now requires a receipt key and a
+      // single-use nonce store; tests stay in memory.
+      receiptKey: 'test-receipt-key',
+      receiptReplay: new InMemoryReplayStore(),
     });
   }
 
