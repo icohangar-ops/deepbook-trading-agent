@@ -210,7 +210,7 @@ See [`src/demo.ts`](src/demo.ts) for an end-to-end walkthrough.
 
 | Method | Description |
 | ------ | ----------- |
-| `executeAgentDecision(decision)` | Validate and execute an agent's decision |
+| `executeAgentDecision(decision)` | Validate and execute an agent's decision. Returns a `TradeResult` carrying the audit fields `success`, `chpDecisionId`, `chpSessionStatus`, `receiptActor` (named confirmer or `chp:policy-engine`), and `receiptNonce` (consumed single-use receipt nonce) — record all of them in downstream audit logging. |
 | `getAgentReport()` | Get session trading performance report |
 | `getStrategyStatuses()` | Get status of all active strategies |
 | `stopAll()` | Stop all active strategies |
@@ -297,7 +297,10 @@ pattern proven in `erp-control-plane` (`api/genbi/chp.py`):
    `session.getDecisionLedger()`.
 
 `executeAgentDecision` returns `chpDecisionId` / `chpSessionStatus` on each
-`TradeResult`. The demo runs the full loop with a static portfolio snapshot
+`TradeResult`, plus `receiptActor` / `receiptNonce` when a receipt was
+verified at the execution boundary — the full audit key set is
+`success`, `chpDecisionId`, `chpSessionStatus`, `receiptActor`,
+`receiptNonce`. The demo runs the full loop with a static portfolio snapshot
 and names its operator as the confirmer.
 
 ```ts
