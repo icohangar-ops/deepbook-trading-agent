@@ -10,6 +10,7 @@
 
 import { readFileSync, existsSync, realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
+import type { GatePolicy } from '@cubiczan/chp';
 
 export type ChpAction =
   | 'swap'
@@ -55,6 +56,19 @@ export function defaultPolicyPath(): string {
 /** In-tree base that policy files must resolve under (process cwd). */
 export function defaultPolicyBase(): string {
   return resolve(process.cwd());
+}
+
+/** Map the camelCase RiskPolicy onto the normative `@cubiczan/chp` GatePolicy. */
+export function toGatePolicy(policy: RiskPolicy): GatePolicy {
+  return {
+    version: policy.version,
+    max_notional: policy.maxNotionalUsd,
+    daily_cap: policy.dailyNotionalCapUsd,
+    hitl_threshold: policy.hitlThresholdUsd,
+    min_confidence: policy.minConfidence,
+    allowed_actions: [...policy.allowedActions],
+    per_asset_limits: { ...policy.perAssetLimits },
+  };
 }
 
 /**

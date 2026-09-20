@@ -23,6 +23,12 @@ import type {
   AuditEntry,
 } from './types.js';
 import { ChpGate } from './chp/gate.js';
+import {
+  TradeHardeningGate,
+  TradeRejection,
+  type ExecutionEvidence,
+  type PortfolioStateProvider,
+} from './chp/hardening.js';
 
 /* ─── Agent Trading Session ────────────────────────────────────────── */
 
@@ -35,6 +41,17 @@ export interface AgentSessionOptions {
    * config/policy.yaml (falling back to a conservative default policy).
    */
   chpGate?: ChpGate;
+  /**
+   * CHP hardening gate (R0 + foundation + human lock + decision ledger).
+   * If omitted, one is created from DEEPBOOK_CHP_* env defaults.
+   */
+  chpHardening?: TradeHardeningGate;
+  /**
+   * Source of balance/portfolio state for R0 solvency and parity evidence.
+   * R0 refuses every order when this is absent — a trade cannot be proven
+   * solvable from a state nobody can observe.
+   */
+  portfolioState?: PortfolioStateProvider;
 }
 
 /**
@@ -56,6 +73,8 @@ export class AgentTradingSession {
   private auditRefs: string[] = [];
   private activeStrategies: Map<string, MarketMakingStrategy | ArbitrageStrategy | HedgeStrategy | LiquidityStrategy> = new Map();
   private chpGate: ChpGate;
+  private chpHardening: TradeHardeningGate;
+  private portfolioState?: PortfolioStateProvider;
 
   constructor(options: AgentSessionOptions) {
     this.client = options.client;
@@ -63,11 +82,26 @@ export class AgentTradingSession {
     this.config = options.config;
     this.walrusStore = options.walrusStore ?? new WalrusAuditStore();
     this.chpGate = options.chpGate ?? new ChpGate();
+    this.chpHardening = options.chpHardening ?? new TradeHardeningGate();
+    this.portfolioState = options.portfolioState;
   }
 
   /** Expose the CHP gate (e.g. for provenance inspection / human approval). */
   get chp(): ChpGate {
     return this.chpGate;
+  }
+
+  /** Expose the CHP hardening gate (session status, ledger, human lock). */
+  get hardening(): TradeHardeningGate {
+    return this.chpHardening;
+  }
+
+  /**
+   * Trade decision ledger, re-validated on read (`integrity_valid` /
+   * `envelope_valid` per record) — the durable CHP surface for this session.
+   */
+  getDecisionLedger() {
+    return this.chpHardening.records.list();
   }
 
   get sessionId(): string {
@@ -79,11 +113,19 @@ export class AgentTradingSession {
    *
    * Flow:
    * 1. Validate the decision against session config and risk limits
-   * 2. Execute via the appropriate strategy or direct PTB
-   * 3. Store the result on Walrus
-   * 4. Return the trade result
+   * 2. CHP R0 gate — solvable/scoped/valid/worth-it, FATAL before the engine
+   * 3. CHP spend gate (policy caps; Profile B via @cubiczan/chp)
+   * 4. CHP foundation pass + human lock (PROVISIONAL_LOCK -> LOCKED)
+   * 5. Seal the decision into the append-only trade decision ledger
+   * 6. Execute via the appropriate strategy or direct PTB
+   * 7. Store the result on Walrus
+   *
+   * `opts.confirmedBy` names the human confirmer for the hardening lock.
    */
-  async executeAgentDecision(decision: TradingDecision): Promise<TradeResult> {
+  async executeAgentDecision(
+    decision: TradingDecision,
+    opts?: { confirmedBy?: string },
+  ): Promise<TradeResult> {
     const timestamp = Date.now();
     const result: TradeResult = {
       decision,
@@ -95,9 +137,28 @@ export class AgentTradingSession {
       // 1. Validate against session config & risk limits
       this.validateDecision(decision);
 
-      // 1b. CHP decision gate (governance). Blocks or defers capital-moving
-      //     decisions whose notional breaches policy before any execution.
+      // 2. CHP R0 gate — before the engine. FATAL failures halt the trade:
+      //    nothing executed, nothing persisted.
       const notionalUsd = this.deriveNotional(decision);
+      const portfolio = this.portfolioState
+        ? await this.portfolioState.getPortfolio()
+        : undefined;
+      const r0 = this.chpHardening.evaluateR0({
+        action: decision.action,
+        poolId: decision.poolId,
+        notionalUsd,
+        rationale: decision.reason,
+        confidence: decision.confidence,
+        portfolio,
+        maxNotionalUsd: this.chpGate.getPolicy().maxNotionalUsd,
+        maxDailyTrades: this.config.riskLimits.maxDailyTrades,
+        allowedPools: this.config.allowedPools,
+        allowedActions: this.chpGate.getPolicy().allowedActions,
+        minConfidence: this.chpGate.getPolicy().minConfidence,
+      });
+
+      // 3. CHP spend gate (Profile B). Blocks or defers capital-moving
+      //    decisions whose notional breaches policy before any execution.
       const chp = this.chpGate.evaluate({
         action: decision.action,
         poolId: decision.poolId,
@@ -112,7 +173,61 @@ export class AgentTradingSession {
         );
       }
 
-      // 2. Execute
+      // 4. CHP foundation pass (deterministic adversary) + human lock.
+      //    Capital movement is not read-only, so the adversary scores the
+      //    BOUNDED TRADE PLAN against balance/portfolio state BEFORE the
+      //    order is placed (see hardening.ts for the documented divergence
+      //    from the ERP reference, where execution is a read-only query).
+      const bounded = this.deriveBoundedEvidence(decision);
+      const hardened = this.chpHardening.harden({
+        action: decision.action,
+        poolId: decision.poolId,
+        notionalUsd,
+        rationale: decision.reason,
+        confidence: decision.confidence,
+        maxCapitalUsd: Number(this.config.maxCapital),
+        evidence: {
+          guardrailsPassed: true,
+          bounded: bounded.bounded,
+          boundedDetail: bounded.detail,
+          observedQuoteBalanceUsd:
+            portfolio?.quoteBalancesUsd[decision.poolId] ?? portfolio?.totalEquityUsd ?? null,
+          notionalUsd,
+          maxCapitalUsd: Number(this.config.maxCapital),
+        } satisfies ExecutionEvidence,
+      });
+
+      const needsConfirmer =
+        this.chpHardening.requireHumanLock || !this.chpHardening.canSelfCertify(hardened.assessment);
+      if (needsConfirmer) {
+        const confirmedBy = opts?.confirmedBy;
+        if (!confirmedBy) {
+          throw new TradeRejection(
+            this.chpHardening.canSelfCertify(hardened.assessment)
+              ? 'CHP hardening: human lock required (DEEPBOOK_CHP_REQUIRE_HUMAN_LOCK defaults ON) — name a human confirmer before the order is placed'
+              : `CHP hardening: foundation score ${hardened.assessment.score} is below the blockchain/DeFi floor ${this.chpHardening.floor} — the trade cannot self-certify; name a human confirmer`,
+            hardened.assessment,
+          );
+        }
+        this.chpHardening.lock(hardened, confirmedBy);
+      }
+
+      // 5. Seal the locked decision into the append-only ledger before any
+      //    order goes on-chain; the execution outcome surfaces via
+      //    TradeResult and the Walrus audit trail.
+      const record = this.chpHardening.record(hardened, {
+        poolId: decision.poolId,
+        action: decision.action,
+        r0Verdict: r0.verdict,
+        artifacts: {
+          reason: decision.reason,
+          confidence: decision.confidence,
+          params: decision.params,
+          modelSignature: decision.modelSignature ?? null,
+        },
+      });
+      result.chpDecisionId = record.decision_id;
+      result.chpSessionStatus = record.session_status;
       switch (decision.action) {
         case 'swap': {
           const amount = decision.params['amount'] as string;
@@ -201,7 +316,7 @@ export class AgentTradingSession {
 
       result.success = true;
 
-      // 3. Store on Walrus
+      // 6. Store on Walrus
       try {
         const auditEntry: AuditEntry = {
           sessionId: this.config.sessionId,
@@ -252,6 +367,56 @@ export class AgentTradingSession {
       if (Number.isFinite(n) && n > 0) return n;
     }
     return 0;
+  }
+
+  /**
+   * Derive bounded-order-plan evidence for the foundation pass: each action
+   * must carry an explicit execution bound (a slippage bound for swaps, size
+   * caps for strategies). A plan without a bound cannot earn the
+   * bounded-result points — an unbounded swap (minOut 0) is unbounded
+   * slippage and fails the adversary.
+   */
+  private deriveBoundedEvidence(decision: TradingDecision): { bounded: boolean; detail: string } {
+    const p = decision.params;
+    const num = (key: string): number => {
+      const v = p[key];
+      const n = typeof v === 'number' ? v : Number(v);
+      return Number.isFinite(n) ? n : NaN;
+    };
+
+    switch (decision.action) {
+      case 'swap': {
+        const minOut = num('minOut');
+        return Number.isFinite(minOut) && minOut > 0
+          ? { bounded: true, detail: `minOut ${minOut} bounds slippage` }
+          : { bounded: false, detail: `minOut ${p['minOut'] ?? 'unset'} does not bound slippage` };
+      }
+      case 'market_make': {
+        const size = num('positionSize');
+        const max = num('maxPosition');
+        return size > 0 && max > 0
+          ? { bounded: true, detail: `positionSize ${size} within maxPosition ${max}` }
+          : { bounded: false, detail: 'missing positionSize/maxPosition bounds' };
+      }
+      case 'arbitrage': {
+        const cap = num('maxCapitalPerTrade');
+        return cap > 0
+          ? { bounded: true, detail: `maxCapitalPerTrade ${cap} bounds exposure` }
+          : { bounded: false, detail: 'missing maxCapitalPerTrade bound' };
+      }
+      case 'hedge': {
+        const ratio = num('hedgeRatio');
+        return ratio > 0 && ratio <= 1
+          ? { bounded: true, detail: `hedgeRatio ${ratio} within (0, 1]` }
+          : { bounded: false, detail: `hedgeRatio ${p['hedgeRatio'] ?? 'unset'} outside (0, 1]` };
+      }
+      case 'liquidity_provision': {
+        const total = num('totalLiquidity');
+        return total > 0
+          ? { bounded: true, detail: `totalLiquidity ${total} bounds the position` }
+          : { bounded: false, detail: 'missing totalLiquidity bound' };
+      }
+    }
   }
 
   /**

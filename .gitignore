@@ -12,6 +12,9 @@ coverage/
 .env.*
 !.env.example
 
+# CHP state (trade decision ledger defaults to .chp/decisions.jsonl)
+.chp/
+
 # Logs
 *.log
 

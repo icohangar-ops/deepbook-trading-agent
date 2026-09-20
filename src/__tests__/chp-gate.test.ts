@@ -1,16 +1,30 @@
 /**
  * Tests for the CHP decision gate (src/chp/gate.ts)
  *
- * Proves: under-threshold actions LOCK and are allowed; at/over the HITL
- * threshold they require human approval; over the hard max / per-pool /
- * daily caps they are BLOCKED. Also covers the AgentTradingSession wiring.
+ * Proves the normative `@cubiczan/chp` Profile B spend gate through the
+ * ChpGate surface: under-threshold actions LOCK and are allowed; at/over the
+ * HITL threshold they require human approval; over the hard max / per-asset /
+ * daily caps they are BLOCKED; an unsized (zero-notional) action is BLOCKED
+ * (normative `sane-notional` requires notional > 0). Also covers the
+ * AgentTradingSession wiring (with the hardening gate and portfolio state).
  */
 import { describe, it, expect } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ChpGate } from '../chp/gate.js';
 import type { RiskPolicy } from '../chp/policy.js';
 import { AgentTradingSession } from '../agent-integration.js';
 import { DeepBookClient } from '../deepbook-client.js';
+import { StaticPortfolioStateProvider, TradeHardeningGate } from '../chp/hardening.js';
 import type { TradingDecision, TradingSessionConfig } from '../types.js';
+
+/** Hardening gate with a hermetic tmp ledger (no repo-local state in tests). */
+function tmpHardeningGate(): TradeHardeningGate {
+  return new TradeHardeningGate({
+    ledgerPath: join(mkdtempSync(join(tmpdir(), 'chp-gate-test-')), 'decisions.jsonl'),
+  });
+}
 
 function makePolicy(overrides: Partial<RiskPolicy> = {}): RiskPolicy {
   return {
@@ -53,14 +67,15 @@ describe('ChpGate', () => {
     const gate = new ChpGate(makePolicy());
     const d = gate.evaluate({ action: 'swap', poolId: '0xpool1', notionalUsd: 15000, confidence: 0.9 });
     expect(d.allowed).toBe(false);
-    expect(d.provenance.claims.some((c) => c.rule === 'per-pool-cap' && !c.passed)).toBe(true);
+    expect(d.provenance.claims.some((c) => c.rule === 'per-asset-cap' && !c.passed)).toBe(true);
   });
 
-  it('allows a zero-notional (unsized) action', () => {
+  it('BLOCKS a zero-notional (unsized) action per the normative sane-notional rule', () => {
     const gate = new ChpGate(makePolicy());
     const d = gate.evaluate({ action: 'market_make', poolId: '0xpoolX', notionalUsd: 0, confidence: 0.9 });
-    expect(d.allowed).toBe(true);
-    expect(d.state).toBe('LOCKED');
+    expect(d.allowed).toBe(false);
+    expect(d.state).toBe('BLOCKED');
+    expect(d.provenance.claims.some((c) => c.rule === 'sane-notional' && !c.passed)).toBe(true);
   });
 
   it('BLOCKS a low-confidence action', () => {
@@ -100,16 +115,21 @@ describe('AgentTradingSession CHP wiring', () => {
     maxCapital: '100000',
     riskLimits: { maxPositionPerPool: '50000', maxDrawdownFraction: 0.1, maxDailyTrades: 10 },
   };
+  const portfolio = new StaticPortfolioStateProvider({
+    owner: 'test-agent',
+    quoteBalancesUsd: { '0xpool1': 1000000, '0xpool2': 1000000 },
+    totalEquityUsd: 2000000,
+  });
 
   it('blocks an over-max decision at the gate before execution', async () => {
     const gate = new ChpGate(makePolicy({ maxNotionalUsd: 1000, perAssetLimits: {} }));
-    const session = new AgentTradingSession({ client, config, chpGate: gate });
+    const session = new AgentTradingSession({ client, config, chpGate: gate, chpHardening: tmpHardeningGate(), portfolioState: portfolio });
     const decision: TradingDecision = {
       action: 'swap',
       poolId: '0xpool1',
       reason: 'oversized swap',
       confidence: 0.9,
-      params: { amount: '5000', minOut: '0' },
+      params: { amount: '5000', minOut: '4750' },
     };
     const result = await session.executeAgentDecision(decision);
     expect(result.success).toBe(false);
@@ -118,15 +138,16 @@ describe('AgentTradingSession CHP wiring', () => {
 
   it('lets an under-threshold decision through the gate', async () => {
     const gate = new ChpGate(makePolicy({ maxNotionalUsd: 100000, hitlThresholdUsd: 100000, perAssetLimits: {} }));
-    const session = new AgentTradingSession({ client, config, chpGate: gate });
+    const session = new AgentTradingSession({ client, config, chpGate: gate, chpHardening: tmpHardeningGate(), portfolioState: portfolio });
     const decision: TradingDecision = {
       action: 'swap',
       poolId: '0xpool1',
       reason: 'small swap',
       confidence: 0.9,
-      params: { amount: '100', minOut: '0' },
+      params: { amount: '100', minOut: '95' },
     };
-    const result = await session.executeAgentDecision(decision);
+    // The hardening human lock defaults ON — name the confirmer.
+    const result = await session.executeAgentDecision(decision, { confirmedBy: 'sam@cubiczan.com' });
     // Execution may still fail downstream (no signer in tests), but the error
     // must NOT be a CHP-gate rejection — the gate let it through.
     if (!result.success && result.error) {

@@ -264,6 +264,55 @@ import { ChpGate, AgentTradingSession } from 'deepbook-trading-agent';
 const session = new AgentTradingSession({ client, config, chpGate: new ChpGate() });
 ```
 
+### CHP hardening (R0 · foundation score · human lock · decision ledger)
+
+On top of the spend gate, every order now runs through a full **CHP hardening
+pass** (`src/chp/hardening.ts`) — a TypeScript port of the decision-record
+pattern proven in `erp-control-plane` (`api/genbi/chp.py`):
+
+1. **R0 gate — before every order**: *is this trade solvable from the current
+   balance/portfolio state?* Results use the capitalized keys `Solvable`,
+   `Scoped`, `Valid`, `Worth_it`; any `FATAL` refuses the order (a
+   `TradeRejection` is thrown before a PTB is built). Portfolio state comes
+   from a `PortfolioStateProvider` — `StaticPortfolioStateProvider` wraps a
+   snapshot; production deployments should supply a live one. Bounded-plan
+   evidence is derived from the decision: swap slippage (`minOut`),
+   market-making position caps, arbitrage capital caps, hedge ratios, and LP
+   size limits; a swap with `minOut: 0` is treated as unbounded.
+2. **Deterministic foundation pass** (no LLM in the loop): guardrails 40 +
+   bounded result 30 + parity 30. Parity asserts the observed quote balance /
+   portfolio state against the execution plan (or against pinned golden trade
+   cases via `DEEPBOOK_CHP_GOLDEN_PATH`); **a parity mismatch is fatal**. The
+   blockchain/DeFi domain floors at **85** — below the floor the trade cannot
+   self-certify and requires a named human confirmer.
+3. **Human lock**: the session starts `EXPLORING`; every hardened trade opens
+   `PROVISIONAL_LOCK`, and `confirmed_by` (a named operator) locks it via
+   third-party validation before execution. `DEEPBOOK_CHP_REQUIRE_HUMAN_LOCK`
+   (default **on**) makes the confirmer mandatory for every order.
+4. **Trade decision ledger**: each locked trade seals an append-only JSONL
+   record (`.chp/decisions.jsonl`, configurable via `ledgerPath`) with a
+   SHA-256 `body_sha256` of the canonical decision body. The payload envelope
+   is structure-only; reads re-validate the digest and expose
+   `integrity_valid` / `envelope_valid`. Inspect it via
+   `session.getDecisionLedger()`.
+
+`executeAgentDecision` returns `chpDecisionId` / `chpSessionStatus` on each
+`TradeResult`. The demo runs the full loop with a static portfolio snapshot
+and names its operator as the confirmer.
+
+```ts
+import { TradeHardeningGate, StaticPortfolioStateProvider, AgentTradingSession } from 'deepbook-trading-agent';
+
+const session = new AgentTradingSession({
+  client,
+  config,
+  chpHardening: new TradeHardeningGate({ requireHumanLock: true }),
+  portfolioState: new StaticPortfolioStateProvider({ owner: 'my-agent', quoteBalancesUsd: { [poolId]: 250_000 } }),
+});
+const result = await session.executeAgentDecision(decision, { confirmedBy: 'operator@example.com' });
+if (result.success) console.log(result.chpDecisionId, result.chpSessionStatus); // LOCKED
+```
+
 ## Development
 
 ```bash
@@ -287,7 +336,13 @@ deepbook-trading-agent/
 │   ├── agent-integration.ts   # AI agent session management
 │   ├── types.ts               # Type definitions
 │   ├── demo.ts                # End-to-end demo
+│   ├── chp/                   # CHP decision gate + hardening layer
+│   │   ├── gate.ts            # Profile B spend gate (normative @cubiczan/chp)
+│   │   ├── policy.ts          # Policy loading with safe defaults
+│   │   └── hardening.ts       # R0 + foundation + human lock + ledger
 │   └── __tests__/             # Test suites
+├── config/
+│   └── policy.yaml            # CHP spend-gate policy
 ├── package.json
 ├── tsconfig.json
 └── README.md

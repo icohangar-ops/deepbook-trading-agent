@@ -1,19 +1,32 @@
 /**
- * deepbook-trading-agent — CHP Decision Gate
+ * deepbook-trading-agent — CHP Decision Gate (Profile B spend gate)
  *
- * Port of the CleanMandate / SwarmFi-Executor CHP gate:
+ * Spend-policy evaluation now delegates to the normative `@cubiczan/chp`
+ * engine (`evaluateGate` / `approveHuman`, spec §6.3/§6.5) — the same engine
+ * the clearance-gate example consumes. This class keeps the repo's public
+ * surface and adds the session state the pure engine needs:
  *   - loads a risk policy (config/policy.yaml, conservative default fallback)
- *   - drives a proposed action through decision states
- *       EXPLORING -> PROVISIONAL -> LOCKED (or BLOCKED / HITL_REQUIRED)
- *   - runs a lightweight adversarial / sanity check
- *   - records per-decision provenance (an append-only in-memory ledger)
- *   - BLOCKS or requires HITL approval when notional exceeds a threshold
+ *   - tracks the rolling daily committed notional and passes it as
+ *     `committedToday`
+ *   - records per-decision provenance (an append-only in-memory ledger) with
+ *     the engine's canonical content hash
  *
- * Capital-moving decisions must pass gate.evaluate(action) before submission.
+ * Normative semantics (supersede the earlier in-tree port):
+ *   - notional must be finite and > 0 (`sane-notional`) — an unsized action
+ *     is BLOCKED, not waved through
+ *   - hard violations collect first → BLOCKED; a clean action at/above the
+ *     HITL threshold (inclusive) → HITL_REQUIRED; otherwise LOCKED
+ *
+ * The Profile A hardening flow (R0 gate, foundation scoring, human lock,
+ * decision ledger) lives in `src/chp/hardening.ts` (ported from the
+ * erp-control-plane GenBI promotion gate). Capital-moving decisions must
+ * pass BOTH gates before submission.
  */
 
-import { createHash, randomUUID } from 'node:crypto';
-import { loadPolicy, defaultPolicyPath, type RiskPolicy, type ChpAction } from './policy.js';
+import { randomUUID } from 'node:crypto';
+import { evaluateGate as chpEvaluateGate, approveHuman as chpApproveHuman } from '@cubiczan/chp';
+import type { Claim } from '@cubiczan/chp';
+import { loadPolicy, defaultPolicyPath, toGatePolicy, type RiskPolicy, type ChpAction } from './policy.js';
 
 export type { ChpAction } from './policy.js';
 export type { RiskPolicy } from './policy.js';
@@ -46,7 +59,7 @@ export interface Provenance {
   action: ProposedAction;
   state: ChpState;
   contentHash: string;
-  claims: { rule: string; passed: boolean; detail: string }[];
+  claims: Claim[];
 }
 
 export interface ChpDecision {
@@ -77,110 +90,39 @@ export class ChpGate {
   }
 
   /**
-   * Evaluate a proposed capital-moving action.
-   *
-   * States: EXPLORING (received) -> run policy + adversarial checks.
-   *   - any hard violation          => BLOCKED  (allowed=false)
-   *   - notional >= hitl_threshold  => HITL_REQUIRED (allowed=false, requiresHuman)
-   *   - otherwise                   => PROVISIONAL -> LOCKED (allowed=true)
+   * Evaluate a proposed capital-moving action through the normative engine.
+   * On LOCKED the engine's committed_delta is folded into the rolling daily
+   * total; BLOCKED and HITL_REQUIRED commit nothing.
    */
   evaluate(proposed: ProposedAction): ChpDecision {
-    const claims: Provenance['claims'] = [];
-    const add = (rule: string, passed: boolean, detail: string) =>
-      claims.push({ rule, passed, detail });
-
-    // ── Policy checks (hard blocks) ──────────────────────────
-    const actionAllowed = this.policy.allowedActions.includes(proposed.action);
-    add('allowed-action', actionAllowed, `action ${proposed.action}`);
-
-    const poolCap = this.policy.perAssetLimits[proposed.poolId];
-    const effectiveCap = poolCap ?? this.policy.maxNotionalUsd;
-    const underPoolCap = proposed.notionalUsd <= effectiveCap;
-    add('per-pool-cap', underPoolCap, `${proposed.poolId} notional ${proposed.notionalUsd} vs cap ${effectiveCap}`);
-
-    const underMax = proposed.notionalUsd <= this.policy.maxNotionalUsd;
-    add('max-notional', underMax, `${proposed.notionalUsd} vs max ${this.policy.maxNotionalUsd}`);
-
     this.rollDailyWindow();
-    const projectedDaily = this.dailyNotionalUsd + proposed.notionalUsd;
-    const underDaily = projectedDaily <= this.policy.dailyNotionalCapUsd;
-    add('daily-cap', underDaily, `projected ${projectedDaily} vs daily cap ${this.policy.dailyNotionalCapUsd}`);
-
-    const sane = this.adversarialCheck(proposed, add);
-
-    const hardOk = actionAllowed && underPoolCap && underMax && underDaily && sane;
-    if (!hardOk) {
-      const failed = claims.filter((c) => !c.passed).map((c) => c.rule);
-      return this.finalize(proposed, 'BLOCKED', claims, false, false, `blocked: ${failed.join(', ')}`);
-    }
-
-    // Passed hard checks -> PROVISIONAL, then HITL / LOCK.
-    const requiresHuman = proposed.notionalUsd >= this.policy.hitlThresholdUsd;
-    if (requiresHuman) {
-      return this.finalize(
-        proposed,
-        'HITL_REQUIRED',
-        claims,
-        false,
-        true,
-        `human approval required: ${proposed.notionalUsd} >= HITL threshold ${this.policy.hitlThresholdUsd}`,
-      );
-    }
-
-    this.dailyNotionalUsd = projectedDaily;
-    return this.finalize(proposed, 'LOCKED', claims, true, false, 'auto-approved under CHP thresholds');
+    const result = chpEvaluateGate(this.toEngineAction(proposed), toGatePolicy(this.policy), this.dailyNotionalUsd);
+    if (result.state === 'LOCKED') this.dailyNotionalUsd += result.committed_delta;
+    return this.finalize(proposed, result);
   }
 
   /**
    * Register an explicit human approval for a HITL-gated action, promoting it
-   * to LOCKED. Mirrors the donor `principal_approve`.
+   * to LOCKED. Mirrors the donor `principal_approve` / engine `approveHuman`:
+   * approval may cross the HITL threshold, never the hard rules.
    */
   approveHuman(proposed: ProposedAction, approver: string): ChpDecision {
     this.rollDailyWindow();
-    const projectedDaily = this.dailyNotionalUsd + proposed.notionalUsd;
-    if (projectedDaily > this.policy.dailyNotionalCapUsd || proposed.notionalUsd > this.policy.maxNotionalUsd) {
-      return this.finalize(
-        proposed,
-        'BLOCKED',
-        [{ rule: 'post-approval-recheck', passed: false, detail: 'exceeds hard caps even with approval' }],
-        false,
-        false,
-        'human approval rejected: exceeds hard caps',
-      );
-    }
-    this.dailyNotionalUsd = projectedDaily;
-    return this.finalize(
-      proposed,
-      'LOCKED',
-      [{ rule: 'human-approval', passed: true, detail: `approved by ${approver}` }],
-      true,
-      false,
-      `human-approved by ${approver}`,
-    );
+    const result = chpApproveHuman(this.toEngineAction(proposed), toGatePolicy(this.policy), approver, this.dailyNotionalUsd);
+    if (result.state === 'LOCKED') this.dailyNotionalUsd += result.committed_delta;
+    return this.finalize(proposed, result);
   }
 
   // ── Internals ──────────────────────────────────────────────
 
-  private adversarialCheck(
-    proposed: ProposedAction,
-    add: (rule: string, passed: boolean, detail: string) => void,
-  ): boolean {
-    let ok = true;
-
-    // A notional of exactly 0 means "unsized" — the strategy applies its own
-    // defaults/caps downstream, so it is allowed through. Negative / NaN /
-    // Infinity notionals are always rejected.
-    const saneNotional = Number.isFinite(proposed.notionalUsd) && proposed.notionalUsd >= 0;
-    add('sane-notional', saneNotional, `notional=${proposed.notionalUsd}`);
-    if (!saneNotional) ok = false;
-
-    if (proposed.confidence !== undefined) {
-      const confidentEnough = proposed.confidence >= this.policy.minConfidence;
-      add('min-confidence', confidentEnough, `confidence ${proposed.confidence} vs min ${this.policy.minConfidence}`);
-      if (!confidentEnough) ok = false;
-    }
-
-    return ok;
+  private toEngineAction(proposed: ProposedAction) {
+    return {
+      action: proposed.action,
+      asset: proposed.poolId,
+      notional: proposed.notionalUsd,
+      confidence: proposed.confidence ?? null,
+      rationale: proposed.rationale,
+    };
   }
 
   private rollDailyWindow(): void {
@@ -191,26 +133,29 @@ export class ChpGate {
     }
   }
 
-  private finalize(
-    action: ProposedAction,
-    state: ChpState,
-    claims: Provenance['claims'],
-    allowed: boolean,
-    requiresHuman: boolean,
-    reason: string,
-  ): ChpDecision {
-    const timestamp = new Date().toISOString();
-    const canonical = JSON.stringify({ action, state, claims, timestamp });
-    const contentHash = createHash('sha256').update(canonical).digest('hex');
+  private finalize(action: ProposedAction, result: {
+    state: 'LOCKED' | 'HITL_REQUIRED' | 'BLOCKED';
+    allowed: boolean;
+    requires_human: boolean;
+    reason: string;
+    claims: Claim[];
+    content_hash: string;
+  }): ChpDecision {
     const provenance: Provenance = {
       decisionId: randomUUID(),
-      timestamp,
+      timestamp: new Date().toISOString(),
       action,
-      state,
-      contentHash,
-      claims,
+      state: result.state,
+      contentHash: result.content_hash,
+      claims: result.claims,
     };
     this.ledger.push(provenance);
-    return { allowed, requiresHuman, state, reason, provenance };
+    return {
+      allowed: result.allowed,
+      requiresHuman: result.requires_human,
+      state: result.state,
+      reason: result.reason,
+      provenance,
+    };
   }
 }

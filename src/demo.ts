@@ -16,6 +16,7 @@ import { DeepBookClient } from './deepbook-client.js';
 import { PTBTrader, WalrusAuditStore } from './ptb-trading.js';
 import { MarketMakingStrategy, ArbitrageStrategy } from './strategies.js';
 import { AgentTradingSession } from './agent-integration.js';
+import { StaticPortfolioStateProvider } from './chp/hardening.js';
 import type {
   TradingDecision,
   TradingSessionConfig,
@@ -201,12 +202,27 @@ async function main(): Promise<void> {
     },
   };
 
+  // CHP hardening: R0 checks every trade against balance/portfolio state.
+  // The demo supplies static state; production deployments must provide a
+  // real PortfolioStateProvider. The human lock defaults ON, so every order
+  // names a confirmer before it can LOCK.
+  const portfolioState = new StaticPortfolioStateProvider({
+    owner: 'demo-agent',
+    quoteBalancesUsd: {
+      [DEMO_POOL_YES]: 250000,
+      [DEMO_POOL_NO]: 250000,
+    },
+    totalEquityUsd: 500000,
+  });
+
   const session = new AgentTradingSession({
     client,
     config: sessionConfig,
     walrusStore,
+    portfolioState,
   });
   logSuccess(`Session created: ${session.sessionId}`);
+  logInfo(`CHP hardening session status: ${session.hardening.sessionStatus} (human lock ${session.hardening.requireHumanLock ? 'ON' : 'OFF'})`);
 
   /* ── Step 2: Create Prediction Market Pool ─────────────────────── */
 
@@ -272,10 +288,14 @@ async function main(): Promise<void> {
     `Action: ${decision.action} on pool ${decision.poolId.slice(0, 10)}...`
   );
 
-  const result = await session.executeAgentDecision(decision);
+  const result = await session.executeAgentDecision(decision, {
+    // The CHP human lock defaults ON — the demo names its operator.
+    confirmedBy: 'sam@cubiczan.com',
+  });
 
   if (result.success) {
     logSuccess('Decision executed successfully');
+    if (result.chpDecisionId) logInfo(`CHP decision: ${result.chpDecisionId} (${result.chpSessionStatus})`);
     if (result.txDigest) logInfo(`Transaction: ${result.txDigest}`);
     if (result.walrusBlobId) logInfo(`Walrus blob: ${result.walrusBlobId}`);
   } else {
@@ -292,7 +312,9 @@ async function main(): Promise<void> {
   const secondDecision = simulateAIAgent(session.sessionId, poolId, newPrice);
 
   logStep('Second decision', `${secondDecision.action}`);
-  const result2 = await session.executeAgentDecision(secondDecision);
+  const result2 = await session.executeAgentDecision(secondDecision, {
+    confirmedBy: 'sam@cubiczan.com',
+  });
 
   if (result2.success) {
     logSuccess('Second decision executed');
@@ -307,6 +329,16 @@ async function main(): Promise<void> {
   logStep('Getting trading report');
   const report = await session.getAgentReport();
   logSuccess('Report generated');
+
+  logStep('Reading the CHP trade decision ledger');
+  for (const record of session.getDecisionLedger()) {
+    logInfo(
+      `${record.decision_id} ${record.action} ${record.pool_id.slice(0, 10)}… ` +
+        `score ${record.foundation_score} ${record.session_status}` +
+        `${record.confirmed_by ? ` by ${record.confirmed_by}` : ''} ` +
+        `integrity_valid=${record.integrity_valid}`,
+    );
+  }
 
   logStep('Storing report on Walrus');
   try {

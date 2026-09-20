@@ -172,6 +172,10 @@ export interface TradeResult {
   walrusBlobId?: string;
   error?: string;
   timestamp: number;
+  /** CHP hardening: id of the sealed trade decision record (ledger lookup key). */
+  chpDecisionId?: string;
+  /** CHP hardening: session status at seal time (PROVISIONAL_LOCK / LOCKED). */
+  chpSessionStatus?: string;
 }
 
 export interface TradingSessionConfig {
