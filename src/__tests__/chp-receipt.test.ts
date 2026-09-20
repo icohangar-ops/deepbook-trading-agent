@@ -163,6 +163,24 @@ describe('verifyExecutionReceipt — allow / deny', () => {
     if (!verdict.ok) expect(verdict.reason).toContain('policy_version');
   });
 
+  it('the boundary compares the LIVE gate policy version, not the receipt self-report', () => {
+    // Regression for the prelint finding: the execution boundary passed
+    // `receipt.policy_version` as the expected version — a vacuous
+    // self-comparison that would let a receipt signed under a rotated
+    // policy pass verification. The gate policy is the source of truth.
+    const stale = issueAllow({ policy_version: '0.9-legacy' });
+    const gatePolicyVersion = '1.0-default'; // what this.chpGate.getPolicy().version returns
+    const verdict = verifyExecutionReceipt(
+      stale,
+      { argsHash: stale.args_hash, policyVersion: gatePolicyVersion, key: KEY },
+      new InMemoryReplayStore(),
+    );
+    expect(verdict).toEqual({
+      ok: false,
+      reason: `receipt policy_version 0.9-legacy != ${gatePolicyVersion}`,
+    });
+  });
+
   it('consumes the nonce exactly once — replay is a deny', () => {
     const replay = new InMemoryReplayStore();
     const receipt = issueAllow();
@@ -222,6 +240,61 @@ describe('FileReplayStore — restart persistence', () => {
       const second = new FileReplayStore(logPath);
       expect(second.seen('n-1')).toBe(true);
       expect(second.seen('n-2')).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('prunes entries older than maxAgeMs on load and compacts the log — no false deny', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deepbook-replay-prune-'));
+    try {
+      const logPath = join(dir, 'state', 'replay-nonces.jsonl');
+      mkdirSync(join(dir, 'state'), { recursive: true });
+      const fresh = {
+        nonce: 'fresh-nonce', consumedAt: new Date().toISOString(),
+        argsHash: 'h', tool: 't', resource: 'r',
+      };
+      const stale = {
+        nonce: 'stale-nonce', consumedAt: new Date(Date.now() - 2 * 300_000).toISOString(),
+        argsHash: 'h', tool: 't', resource: 'r',
+      };
+      const unparseable = {
+        nonce: 'odd-nonce', consumedAt: 'not-a-timestamp',
+        argsHash: 'h', tool: 't', resource: 'r',
+      };
+      writeFileSync(
+        logPath,
+        [fresh, stale, unparseable].map((r) => JSON.stringify(r)).join('\n') + '\n',
+        'utf-8',
+      );
+      const pruned = new FileReplayStore(logPath, 300_000);
+      // Stale is forgotten (it cannot be replayed by a valid receipt — it
+      // is expired); fresh and unparseable-timestamp records survive.
+      expect(pruned.seen('stale-nonce')).toBe(false);
+      expect(pruned.seen('fresh-nonce')).toBe(true);
+      expect(pruned.seen('odd-nonce')).toBe(true);
+      // The log is compacted on disk: a fresh instance agrees.
+      const reopened = new FileReplayStore(logPath, 300_000);
+      expect(reopened.seen('stale-nonce')).toBe(false);
+      expect(reopened.seen('fresh-nonce')).toBe(true);
+      expect(reopened.seen('odd-nonce')).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('without maxAgeMs the store keeps every entry regardless of age', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'deepbook-replay-keepall-'));
+    try {
+      const logPath = join(dir, 'state', 'replay-nonces.jsonl');
+      mkdirSync(join(dir, 'state'), { recursive: true });
+      const stale = {
+        nonce: 'stale-nonce', consumedAt: new Date(Date.now() - 10 * 300_000).toISOString(),
+        argsHash: 'h', tool: 't', resource: 'r',
+      };
+      writeFileSync(logPath, JSON.stringify(stale) + '\n', 'utf-8');
+      const store = new FileReplayStore(logPath);
+      expect(store.seen('stale-nonce')).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

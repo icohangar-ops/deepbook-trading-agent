@@ -334,11 +334,24 @@ order is built; replaying the same receipt is a deny.
   committed default key).
 - `DEEPBOOK_CHP_REPLAY_LOG` — nonce replay log (default
   `state/replay-nonces.jsonl`); consumed approvals survive a restart, and a
-  corrupt log line is skipped rather than trusted.
+  corrupt log line is skipped rather than trusted. Entries older than the
+  receipt TTL (300s) are **pruned on startup** and the log compacted — a
+  nonce past the TTL cannot be replayed by a valid receipt, so this bounds
+  startup cost for long-running deployments with no security regression;
+  records with an unparseable timestamp are kept, never dropped.
 
 `TradeResult` records `receiptActor` (the named confirmer, or
 `chp:policy-engine` for autonomous execution) and `receiptNonce` (the
 consumed single-use nonce — the replay audit key).
+
+**Risk tier is audit-only today.** The tier is computed from the trade
+notional relative to the policy spending ceiling — `high` at 50% of the
+ceiling or above (an arbitrary-but-deterministic boundary), `medium` for
+any positive notional, `low` at zero — and is signed into the receipt and
+recorded with the trade result. No gate, alert, or HITL trigger behaves
+differently for `high` vs `medium` yet; an operator seeing a `high` receipt
+should not expect a behavioral consequence. Wiring one (for example, a
+HITL trigger at the `high` boundary) is the documented reopening condition.
 
 ## Propagation notes (wave B)
 

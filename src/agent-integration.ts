@@ -113,7 +113,10 @@ export class AgentTradingSession {
     this.chpHardening = options.chpHardening ?? new TradeHardeningGate();
     this.portfolioState = options.portfolioState;
     this.receiptKeyOverride = options.receiptKey;
-    this.receiptReplay = options.receiptReplay ?? new FileReplayStore(defaultReplayLogPath());
+    // Pass the receipt TTL so entries past it are pruned on startup and the
+    // log compacted — a nonce older than the TTL cannot be replayed by a
+    // valid receipt, so this bounds growth with no security regression.
+    this.receiptReplay = options.receiptReplay ?? new FileReplayStore(defaultReplayLogPath(), RECEIPT_TTL_MS);
   }
 
   /** Expose the CHP gate (e.g. for provenance inspection / human approval). */
@@ -282,7 +285,11 @@ export class AgentTradingSession {
       );
       const receiptCheck = verifyExecutionReceipt(
         receipt,
-        { argsHash, policyVersion: receipt.policy_version, key: receiptKey },
+        // Expected policy version comes from the LIVE gate policy, not from
+        // the receipt's self-report — comparing the field against itself
+        // would make the check vacuous and let a receipt signed under a
+        // rotated/deprecated policy pass verification.
+        { argsHash, policyVersion: this.chpGate.getPolicy().version, key: receiptKey },
         this.receiptReplay,
       );
       if (!receiptCheck.ok) {
