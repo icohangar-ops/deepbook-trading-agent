@@ -372,9 +372,11 @@ HITL trigger at the `high` boundary) is the documented reopening condition.
   external-data dependency to tier) does not hold — nothing is tiered.
   Re-evaluate if off-chain market data is ever added — at which point the
   row applies subject to its own conditions (a free/fast/always-up API
-  leaves tiers 2–3 dead weight; headless surfaces gain no badge value) and
-  via the canonical `cubiczan_resilience.tiered` module, never a second
-  package.
+  leaves tiers 2–3 dead weight; headless surfaces gain no badge value), and
+  the tiered helper lands as a new export of the vendored
+  `@cubiczan/resilience` package (`src/lib/resilience/`, which today
+  exports `safeFetch`, `retry`, `withTimeout`, `ResilienceError`) — never
+  a second package.
 
 ## Development
 
