@@ -4,7 +4,7 @@ Vendored-copy pin for the cubiczan-resilience TypeScript package
 Upstream package : @cubiczan/resilience (TypeScript)
 Upstream repo    : https://github.com/icohangar-ops/cubiczan-resilience
 Pinned version   : typescript-v0.2.0
-Pinned commit    : 60dc5f4b7030bef492fe5df0d432ae49fd612f37
+Pinned commit    : 37ce1571f5beb751d153ecdc3b1457cd9c871e37
 Pin date         : 2026-09-20
 Sync status      : keep-in-sync — this directory is a vendored copy, not the package
 

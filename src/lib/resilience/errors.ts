@@ -3,7 +3,7 @@
  *
  * Vendored from @cubiczan/resilience (icohangar-ops/cubiczan-resilience,
  * typescript/src) at typescript-v0.2.0
- * (commit 60dc5f4b7030bef492fe5df0d432ae49fd612f37).
+ * (commit 37ce1571f5beb751d153ecdc3b1457cd9c871e37).
  * Check the canonical package for updates before modifying locally; this
  * copy's scope and intentional local deltas are recorded in VENDOR_COMMIT.txt
  * beside this file.
