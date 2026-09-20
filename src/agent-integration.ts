@@ -29,6 +29,20 @@ import {
   type ExecutionEvidence,
   type PortfolioStateProvider,
 } from './chp/hardening.js';
+import {
+  RECEIPT_TTL_MS,
+  hashTradeArgs,
+  issueTradeReceipt,
+  resolveReceiptKey,
+  tradeReceiptArgs,
+  verifyExecutionReceipt,
+  type ReceiptRisk,
+} from './chp/receipt.js';
+import {
+  FileReplayStore,
+  defaultReplayLogPath,
+  type ReplayStore,
+} from './chp/replay.js';
 
 /* ─── Agent Trading Session ────────────────────────────────────────── */
 
@@ -52,6 +66,18 @@ export interface AgentSessionOptions {
    * solvable from a state nobody can observe.
    */
   portfolioState?: PortfolioStateProvider;
+  /**
+   * Explicit row-22 receipt signing key. Prefer $DEEPBOOK_CHP_RECEIPT_KEY;
+   * this override exists for tests and embedded callers. Execution fails
+   * closed when neither is set — no order is signed or placed.
+   */
+  receiptKey?: string;
+  /**
+   * Replay store for receipt nonces. Defaults to the JSONL file store
+   * (`state/replay-nonces.jsonl`, overridable via $DEEPBOOK_CHP_REPLAY_LOG)
+   * so consumed approvals survive a restart.
+   */
+  receiptReplay?: ReplayStore;
 }
 
 /**
@@ -75,6 +101,8 @@ export class AgentTradingSession {
   private chpGate: ChpGate;
   private chpHardening: TradeHardeningGate;
   private portfolioState?: PortfolioStateProvider;
+  private readonly receiptKeyOverride?: string;
+  private readonly receiptReplay: ReplayStore;
 
   constructor(options: AgentSessionOptions) {
     this.client = options.client;
@@ -84,6 +112,8 @@ export class AgentTradingSession {
     this.chpGate = options.chpGate ?? new ChpGate();
     this.chpHardening = options.chpHardening ?? new TradeHardeningGate();
     this.portfolioState = options.portfolioState;
+    this.receiptKeyOverride = options.receiptKey;
+    this.receiptReplay = options.receiptReplay ?? new FileReplayStore(defaultReplayLogPath());
   }
 
   /** Expose the CHP gate (e.g. for provenance inspection / human approval). */
@@ -228,6 +258,42 @@ export class AgentTradingSession {
       });
       result.chpDecisionId = record.decision_id;
       result.chpSessionStatus = record.session_status;
+
+      // 5b. Row-22 tool-approval receipt: a gate verdict — even LOCKED — is
+      //     an allowlist answer, not authorization. Issue a receipt binding
+      //     actor/tool/resource/exact trade args/policy/risk/expiry/nonce,
+      //     then verify it at the execution boundary. Fail-closed:
+      //     resolveReceiptKey throws when DEEPBOOK_CHP_RECEIPT_KEY is unset,
+      //     and a failed verification refuses the order before capital moves.
+      const receiptKey = resolveReceiptKey(this.receiptKeyOverride);
+      const receiptArgs = tradeReceiptArgs(decision);
+      const argsHash = hashTradeArgs(receiptArgs);
+      const receipt = issueTradeReceipt(
+        {
+          actor: opts?.confirmedBy ?? 'chp:policy-engine',
+          resource: `deepbook:execute:${decision.poolId}`,
+          args_hash: argsHash,
+          policy_version: this.chpGate.getPolicy().version,
+          risk: this.receiptRiskFor(notionalUsd),
+          decision: 'allow',
+          ttlMs: RECEIPT_TTL_MS,
+        },
+        receiptKey,
+      );
+      const receiptCheck = verifyExecutionReceipt(
+        receipt,
+        { argsHash, policyVersion: receipt.policy_version, key: receiptKey },
+        this.receiptReplay,
+      );
+      if (!receiptCheck.ok) {
+        throw new TradeRejection(
+          `CHP receipt verification failed: ${receiptCheck.reason}`,
+          hardened.assessment,
+        );
+      }
+      result.receiptActor = receiptCheck.receipt.actor;
+      result.receiptNonce = receiptCheck.receipt.nonce;
+
       switch (decision.action) {
         case 'swap': {
           const amount = decision.params['amount'] as string;
@@ -345,6 +411,19 @@ export class AgentTradingSession {
     }
 
     return result;
+  }
+
+  /**
+   * Deterministic row-22 receipt risk tier from the gated notional and the
+   * policy's per-action ceiling: at half the cap or more the approval is
+   * high risk, any positive notional is medium, and a zero-notional action
+   * is low.
+   */
+  private receiptRiskFor(notionalUsd: number): ReceiptRisk {
+    const cap = this.chpGate.getPolicy().maxNotionalUsd;
+    if (notionalUsd >= cap / 2) return 'high';
+    if (notionalUsd > 0) return 'medium';
+    return 'low';
   }
 
   /**
