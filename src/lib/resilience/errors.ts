@@ -1,4 +1,15 @@
 /**
+ * VENDORED COPY — keep in sync with the canonical package.
+ *
+ * Vendored from @cubiczan/resilience (icohangar-ops/cubiczan-resilience,
+ * typescript/src) at typescript-v0.2.0
+ * (commit 37ce1571f5beb751d153ecdc3b1457cd9c871e37).
+ * Check the canonical package for updates before modifying locally; this
+ * copy's scope and intentional local deltas are recorded in VENDOR_COMMIT.txt
+ * beside this file.
+ */
+
+/**
  * Discriminated reasons a resilient operation can ultimately fail.
  *
  * - `timeout`     — an attempt exceeded its allotted time budget.
