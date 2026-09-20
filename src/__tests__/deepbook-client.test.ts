@@ -30,10 +30,31 @@ describe('DeepBookClient', () => {
     ).rejects.toThrow('Keypair required');
   });
 
-  it('should throw PoolNotFoundError for non-existent pool', async () => {
+  it('should throw PoolNotFoundError for a pool with no on-chain content', async () => {
     const client = new DeepBookClient();
     const fakePoolId = '0xdeadbeef00000000000000000000000000000001';
+    // Public Sui fullnode JSON-RPC has been deprecated upstream (methods now
+    // throw "Method not found"), so the RPC client is stubbed: this test
+    // proves the classification path (no pool content -> PoolNotFoundError),
+    // not live RPC reachability.
+    Object.assign(
+      (client as unknown as { client: { getObject: (args: unknown) => Promise<unknown> } }).client,
+      { getObject: async () => ({ data: null }) },
+    );
     await expect(client.getOrderbook(fakePoolId)).rejects.toThrow(PoolNotFoundError);
+  });
+
+  it('should wrap RPC transport failures as DeepBookError', async () => {
+    const client = new DeepBookClient();
+    const fakePoolId = '0xdeadbeef00000000000000000000000000000001';
+    // Mirrors the real upstream error now returned by public fullnodes.
+    Object.assign(
+      (client as unknown as { client: { getObject: (args: unknown) => Promise<unknown> } }).client,
+      { getObject: async () => { throw new Error('Method not found. JSON-RPC on public fullnodes has been deprecated.'); } },
+    );
+    await expect(client.getOrderbook(fakePoolId)).rejects.toThrow(
+      `Failed to fetch orderbook for pool ${fakePoolId}`,
+    );
   });
 });
 
